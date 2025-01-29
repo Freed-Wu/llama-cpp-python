@@ -1,111 +1,141 @@
+from __future__ import annotations
+
+import os
 import json
-import multiprocessing
-from threading import Lock
+import typing
+import contextlib
+
+from anyio import Lock
 from functools import partial
-from typing import Iterator, List, Optional, Union, Dict
-from typing_extensions import TypedDict, Literal
+from typing import List, Optional, Union, Dict
 
 import llama_cpp
 
 import anyio
 from anyio.streams.memory import MemoryObjectSendStream
 from starlette.concurrency import run_in_threadpool, iterate_in_threadpool
-from fastapi import Depends, FastAPI, APIRouter, Request
+from fastapi import Depends, FastAPI, APIRouter, Request, HTTPException, status, Body
+from fastapi.middleware import Middleware
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings
+from fastapi.security import HTTPBearer
 from sse_starlette.sse import EventSourceResponse
+from starlette_context.plugins import RequestIdPlugin  # type: ignore
+from starlette_context.middleware import RawContextMiddleware
+
+from llama_cpp.server.model import (
+    LlamaProxy,
+)
+from llama_cpp.server.settings import (
+    ConfigFileSettings,
+    Settings,
+    ModelSettings,
+    ServerSettings,
+)
+from llama_cpp.server.types import (
+    CreateCompletionRequest,
+    CreateEmbeddingRequest,
+    CreateChatCompletionRequest,
+    ModelList,
+    TokenizeInputRequest,
+    TokenizeInputResponse,
+    TokenizeInputCountResponse,
+    DetokenizeInputRequest,
+    DetokenizeInputResponse,
+)
+from llama_cpp.server.errors import RouteErrorHandler
 
 
-class Settings(BaseSettings):
-    model: str = Field(
-        description="The path to the model to use for generating completions."
-    )
-    model_alias: Optional[str] = Field(
-        default=None,
-        description="The alias of the model to use for generating completions.",
-    )
-    n_ctx: int = Field(default=2048, ge=1, description="The context size.")
-    n_gpu_layers: int = Field(
-        default=0,
-        ge=0,
-        description="The number of layers to put on the GPU. The rest will be on the CPU.",
-    )
-    tensor_split: Optional[List[float]] = Field(
-        default=None,
-        description="Split layers across multiple GPUs in proportion.",
-    )
-    rope_freq_base: float = Field(default=10000, ge=1, description="RoPE base frequency")
-    rope_freq_scale: float = Field(default=1.0, description="RoPE frequency scaling factor")
-    seed: int = Field(
-        default=1337, description="Random seed. -1 for random."
-    )
-    n_batch: int = Field(
-        default=512, ge=1, description="The batch size to use per eval."
-    )
-    n_threads: int = Field(
-        default=max(multiprocessing.cpu_count() // 2, 1),
-        ge=1,
-        description="The number of threads to use.",
-    )
-    f16_kv: bool = Field(default=True, description="Whether to use f16 key/value.")
-    use_mlock: bool = Field(
-        default=llama_cpp.llama_mlock_supported(),
-        description="Use mlock.",
-    )
-    use_mmap: bool = Field(
-        default=llama_cpp.llama_mmap_supported(),
-        description="Use mmap.",
-    )
-    embedding: bool = Field(default=True, description="Whether to use embeddings.")
-    low_vram: bool = Field(
-        default=False,
-        description="Whether to use less VRAM. This will reduce performance.",
-    )
-    last_n_tokens_size: int = Field(
-        default=64,
-        ge=0,
-        description="Last n tokens to keep for repeat penalty calculation.",
-    )
-    logits_all: bool = Field(default=True, description="Whether to return logits.")
-    cache: bool = Field(
-        default=False,
-        description="Use a cache to reduce processing times for evaluated prompts.",
-    )
-    cache_type: Literal["ram", "disk"] = Field(
-        default="ram",
-        description="The type of cache to use. Only used if cache is True.",
-    )
-    cache_size: int = Field(
-        default=2 << 30,
-        description="The size of the cache in bytes. Only used if cache is True.",
-    )
-    vocab_only: bool = Field(
-        default=False, description="Whether to only return the vocabulary."
-    )
-    verbose: bool = Field(
-        default=True, description="Whether to print debug information."
-    )
-    host: str = Field(default="localhost", description="Listen address")
-    port: int = Field(default=8000, description="Listen port")
-    interrupt_requests: bool = Field(
-        default=True,
-        description="Whether to interrupt requests when a new request is received.",
-    )
+router = APIRouter(route_class=RouteErrorHandler)
+
+_server_settings: Optional[ServerSettings] = None
 
 
-router = APIRouter()
+def set_server_settings(server_settings: ServerSettings):
+    global _server_settings
+    _server_settings = server_settings
 
-settings: Optional[Settings] = None
-llama: Optional[llama_cpp.Llama] = None
+
+def get_server_settings():
+    yield _server_settings
 
 
-def create_app(settings: Optional[Settings] = None):
-    if settings is None:
-        settings = Settings()
+_llama_proxy: Optional[LlamaProxy] = None
+
+llama_outer_lock = Lock()
+llama_inner_lock = Lock()
+
+
+def set_llama_proxy(model_settings: List[ModelSettings]):
+    global _llama_proxy
+    _llama_proxy = LlamaProxy(models=model_settings)
+
+
+async def get_llama_proxy():
+    # NOTE: This double lock allows the currently streaming llama model to
+    # check if any other requests are pending in the same thread and cancel
+    # the stream if so.
+    await llama_outer_lock.acquire()
+    release_outer_lock = True
+    try:
+        await llama_inner_lock.acquire()
+        try:
+            llama_outer_lock.release()
+            release_outer_lock = False
+            yield _llama_proxy
+        finally:
+            llama_inner_lock.release()
+    finally:
+        if release_outer_lock:
+            llama_outer_lock.release()
+
+
+_ping_message_factory: typing.Optional[typing.Callable[[], bytes]] = None
+
+
+def set_ping_message_factory(factory: typing.Callable[[], bytes]):
+    global _ping_message_factory
+    _ping_message_factory = factory
+
+
+def create_app(
+    settings: Settings | None = None,
+    server_settings: ServerSettings | None = None,
+    model_settings: List[ModelSettings] | None = None,
+):
+    config_file = os.environ.get("CONFIG_FILE", None)
+    if config_file is not None:
+        if not os.path.exists(config_file):
+            raise ValueError(f"Config file {config_file} not found!")
+        with open(config_file, "rb") as f:
+            # Check if yaml file
+            if config_file.endswith(".yaml") or config_file.endswith(".yml"):
+                import yaml
+
+                config_file_settings = ConfigFileSettings.model_validate_json(
+                    json.dumps(yaml.safe_load(f))
+                )
+            else:
+                config_file_settings = ConfigFileSettings.model_validate_json(f.read())
+            server_settings = ServerSettings.model_validate(config_file_settings)
+            model_settings = config_file_settings.models
+
+    if server_settings is None and model_settings is None:
+        if settings is None:
+            settings = Settings()
+        server_settings = ServerSettings.model_validate(settings)
+        model_settings = [ModelSettings.model_validate(settings)]
+
+    assert (
+        server_settings is not None and model_settings is not None
+    ), "server_settings and model_settings must be provided together"
+
+    set_server_settings(server_settings)
+    middleware = [Middleware(RawContextMiddleware, plugins=(RequestIdPlugin(),))]
     app = FastAPI(
+        middleware=middleware,
         title="🦙 llama.cpp Python API",
-        version="0.0.1",
+        version=llama_cpp.__version__,
+        root_path=server_settings.root_path,
     )
     app.add_middleware(
         CORSMiddleware,
@@ -115,457 +145,453 @@ def create_app(settings: Optional[Settings] = None):
         allow_headers=["*"],
     )
     app.include_router(router)
-    global llama
-    llama = llama_cpp.Llama(
-        model_path=settings.model,
-        n_gpu_layers=settings.n_gpu_layers,
-        tensor_split=settings.tensor_split,
-        rope_freq_base=settings.rope_freq_base,
-        rope_freq_scale=settings.rope_freq_scale,
-        seed=settings.seed,
-        f16_kv=settings.f16_kv,
-        use_mlock=settings.use_mlock,
-        use_mmap=settings.use_mmap,
-        embedding=settings.embedding,
-        logits_all=settings.logits_all,
-        n_threads=settings.n_threads,
-        n_batch=settings.n_batch,
-        n_ctx=settings.n_ctx,
-        last_n_tokens_size=settings.last_n_tokens_size,
-        vocab_only=settings.vocab_only,
-        verbose=settings.verbose,
-    )
-    if settings.cache:
-        if settings.cache_type == "disk":
-            if settings.verbose:
-                print(f"Using disk cache with size {settings.cache_size}")
-            cache = llama_cpp.LlamaDiskCache(capacity_bytes=settings.cache_size)
-        else:
-            if settings.verbose:
-                print(f"Using ram cache with size {settings.cache_size}")
-            cache = llama_cpp.LlamaRAMCache(capacity_bytes=settings.cache_size)
 
-        cache = llama_cpp.LlamaCache(capacity_bytes=settings.cache_size)
-        llama.set_cache(cache)
+    assert model_settings is not None
+    set_llama_proxy(model_settings=model_settings)
 
-    def set_settings(_settings: Settings):
-        global settings
-        settings = _settings
+    if server_settings.disable_ping_events:
+        set_ping_message_factory(lambda: bytes())
 
-    set_settings(settings)
     return app
 
 
-llama_outer_lock = Lock()
-llama_inner_lock = Lock()
+def prepare_request_resources(
+    body: CreateCompletionRequest | CreateChatCompletionRequest,
+    llama_proxy: LlamaProxy,
+    body_model: str | None,
+    kwargs,
+) -> llama_cpp.Llama:
+    if llama_proxy is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service is not available",
+        )
+    llama = llama_proxy(body_model)
+    if body.logit_bias is not None:
+        kwargs["logit_bias"] = (
+            _logit_bias_tokens_to_input_ids(llama, body.logit_bias)
+            if body.logit_bias_type == "tokens"
+            else body.logit_bias
+        )
+
+    if body.grammar is not None:
+        kwargs["grammar"] = llama_cpp.LlamaGrammar.from_string(body.grammar)
+
+    if body.min_tokens > 0:
+        _min_tokens_logits_processor = llama_cpp.LogitsProcessorList(
+            [llama_cpp.MinTokensLogitsProcessor(body.min_tokens, llama.token_eos())]
+        )
+        if "logits_processor" not in kwargs:
+            kwargs["logits_processor"] = _min_tokens_logits_processor
+        else:
+            kwargs["logits_processor"].extend(_min_tokens_logits_processor)
+    return llama
 
 
-def get_llama():
-    # NOTE: This double lock allows the currently streaming llama model to
-    # check if any other requests are pending in the same thread and cancel
-    # the stream if so.
-    llama_outer_lock.acquire()
-    release_outer_lock = True
-    try:
-        llama_inner_lock.acquire()
-        try:
-            llama_outer_lock.release()
-            release_outer_lock = False
-            yield llama
-        finally:
-            llama_inner_lock.release()
-    finally:
-        if release_outer_lock:
-            llama_outer_lock.release()
-
-
-def get_settings():
-    yield settings
-
-
-model_field = Field(description="The model to use for generating completions.", default=None)
-
-max_tokens_field = Field(
-    default=16, ge=1, le=2048, description="The maximum number of tokens to generate."
-)
-
-temperature_field = Field(
-    default=0.8,
-    ge=0.0,
-    le=2.0,
-    description="Adjust the randomness of the generated text.\n\n"
-    + "Temperature is a hyperparameter that controls the randomness of the generated text. It affects the probability distribution of the model's output tokens. A higher temperature (e.g., 1.5) makes the output more random and creative, while a lower temperature (e.g., 0.5) makes the output more focused, deterministic, and conservative. The default value is 0.8, which provides a balance between randomness and determinism. At the extreme, a temperature of 0 will always pick the most likely next token, leading to identical outputs in each run.",
-)
-
-top_p_field = Field(
-    default=0.95,
-    ge=0.0,
-    le=1.0,
-    description="Limit the next token selection to a subset of tokens with a cumulative probability above a threshold P.\n\n"
-    + "Top-p sampling, also known as nucleus sampling, is another text generation method that selects the next token from a subset of tokens that together have a cumulative probability of at least p. This method provides a balance between diversity and quality by considering both the probabilities of tokens and the number of tokens to sample from. A higher value for top_p (e.g., 0.95) will lead to more diverse text, while a lower value (e.g., 0.5) will generate more focused and conservative text.",
-)
-
-stop_field = Field(
-    default=None,
-    description="A list of tokens at which to stop generation. If None, no stop tokens are used.",
-)
-
-stream_field = Field(
-    default=False,
-    description="Whether to stream the results as they are generated. Useful for chatbots.",
-)
-
-top_k_field = Field(
-    default=40,
-    ge=0,
-    description="Limit the next token selection to the K most probable tokens.\n\n"
-    + "Top-k sampling is a text generation method that selects the next token only from the top k most likely tokens predicted by the model. It helps reduce the risk of generating low-probability or nonsensical tokens, but it may also limit the diversity of the output. A higher value for top_k (e.g., 100) will consider more tokens and lead to more diverse text, while a lower value (e.g., 10) will focus on the most probable tokens and generate more conservative text.",
-)
-
-repeat_penalty_field = Field(
-    default=1.1,
-    ge=0.0,
-    description="A penalty applied to each token that is already generated. This helps prevent the model from repeating itself.\n\n"
-    + "Repeat penalty is a hyperparameter used to penalize the repetition of token sequences during text generation. It helps prevent the model from generating repetitive or monotonous text. A higher value (e.g., 1.5) will penalize repetitions more strongly, while a lower value (e.g., 0.9) will be more lenient.",
-)
-
-presence_penalty_field = Field(
-    default=0.0,
-    ge=-2.0,
-    le=2.0,
-    description="Positive values penalize new tokens based on whether they appear in the text so far, increasing the model's likelihood to talk about new topics.",
-)
-
-frequency_penalty_field = Field(
-    default=0.0,
-    ge=-2.0,
-    le=2.0,
-    description="Positive values penalize new tokens based on their existing frequency in the text so far, decreasing the model's likelihood to repeat the same line verbatim.",
-)
-
-mirostat_mode_field = Field(
-    default=0,
-    ge=0,
-    le=2,
-    description="Enable Mirostat constant-perplexity algorithm of the specified version (1 or 2; 0 = disabled)",
-)
-
-mirostat_tau_field = Field(
-    default=5.0,
-    ge=0.0,
-    le=10.0,
-    description="Mirostat target entropy, i.e. the target perplexity - lower values produce focused and coherent text, larger values produce more diverse and less coherent text",
-)
-
-mirostat_eta_field = Field(
-    default=0.1, ge=0.001, le=1.0, description="Mirostat learning rate"
-)
-
-
-class CreateCompletionRequest(BaseModel):
-    prompt: Union[str, List[str]] = Field(
-        default="", description="The prompt to generate completions for."
+async def get_event_publisher(
+    request: Request,
+    inner_send_chan: MemoryObjectSendStream[typing.Any],
+    body: CreateCompletionRequest | CreateChatCompletionRequest,
+    body_model: str | None,
+    llama_call,
+    kwargs,
+):
+    server_settings = next(get_server_settings())
+    interrupt_requests = (
+        server_settings.interrupt_requests if server_settings else False
     )
-    suffix: Optional[str] = Field(
-        default=None,
-        description="A suffix to append to the generated text. If None, no suffix is appended. Useful for chatbots.",
-    )
-    max_tokens: int = max_tokens_field
-    temperature: float = temperature_field
-    top_p: float = top_p_field
-    mirostat_mode: int = mirostat_mode_field
-    mirostat_tau: float = mirostat_tau_field
-    mirostat_eta: float = mirostat_eta_field
-    echo: bool = Field(
-        default=False,
-        description="Whether to echo the prompt in the generated text. Useful for chatbots.",
-    )
-    stop: Optional[Union[str, List[str]]] = stop_field
-    stream: bool = stream_field
-    logprobs: Optional[int] = Field(
-        default=None,
-        ge=0,
-        description="The number of logprobs to generate. If None, no logprobs are generated.",
-    )
-    presence_penalty: Optional[float] = presence_penalty_field
-    frequency_penalty: Optional[float] = frequency_penalty_field
-    logit_bias: Optional[Dict[str, float]] = Field(None)
-    logprobs: Optional[int] = Field(None)
-
-    # ignored or currently unsupported
-    model: Optional[str] = model_field
-    n: Optional[int] = 1
-    best_of: Optional[int] = 1
-    user: Optional[str] = Field(default=None)
-
-    # llama.cpp specific parameters
-    top_k: int = top_k_field
-    repeat_penalty: float = repeat_penalty_field
-    logit_bias_type: Optional[Literal["input_ids", "tokens"]] = Field(None)
-
-    model_config = {
-        "json_schema_extra": {
-            "examples": [
-                {
-                    "prompt": "\n\n### Instructions:\nWhat is the capital of France?\n\n### Response:\n",
-                    "stop": ["\n", "###"],
-                }
-            ]
-        }
-    }
+    async with contextlib.asynccontextmanager(get_llama_proxy)() as llama_proxy:
+        llama = prepare_request_resources(body, llama_proxy, body_model, kwargs)
+        async with inner_send_chan:
+            try:
+                iterator = await run_in_threadpool(llama_call, llama, **kwargs)
+                async for chunk in iterate_in_threadpool(iterator):
+                    await inner_send_chan.send(dict(data=json.dumps(chunk)))
+                    if await request.is_disconnected():
+                        raise anyio.get_cancelled_exc_class()()
+                    if interrupt_requests and llama_outer_lock.locked():
+                        await inner_send_chan.send(dict(data="[DONE]"))
+                        raise anyio.get_cancelled_exc_class()()
+                await inner_send_chan.send(dict(data="[DONE]"))
+            except anyio.get_cancelled_exc_class() as e:
+                print("disconnected")
+                with anyio.move_on_after(1, shield=True):
+                    print(
+                        f"Disconnected from client (via refresh/close) {request.client}"
+                    )
+                    raise e
 
 
-def make_logit_bias_processor(
+def _logit_bias_tokens_to_input_ids(
     llama: llama_cpp.Llama,
     logit_bias: Dict[str, float],
-    logit_bias_type: Optional[Literal["input_ids", "tokens"]],
+) -> Dict[str, float]:
+    to_bias: Dict[str, float] = {}
+    for token, score in logit_bias.items():
+        token = token.encode("utf-8")
+        for input_id in llama.tokenize(token, add_bos=False, special=True):
+            to_bias[str(input_id)] = score
+    return to_bias
+
+
+# Setup Bearer authentication scheme
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+async def authenticate(
+    settings: Settings = Depends(get_server_settings),
+    authorization: Optional[str] = Depends(bearer_scheme),
 ):
-    if logit_bias_type is None:
-        logit_bias_type = "input_ids"
+    # Skip API key check if it's not set in settings
+    if settings.api_key is None:
+        return True
 
-    to_bias: Dict[int, float] = {}
-    if logit_bias_type == "input_ids":
-        for input_id, score in logit_bias.items():
-            input_id = int(input_id)
-            to_bias[input_id] = score
+    # check bearer credentials against the api_key
+    if authorization and authorization.credentials == settings.api_key:
+        # api key is valid
+        return authorization.credentials
 
-    elif logit_bias_type == "tokens":
-        for token, score in logit_bias.items():
-            token = token.encode("utf-8")
-            for input_id in llama.tokenize(token, add_bos=False):
-                to_bias[input_id] = score
+    # raise http error 401
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid API key",
+    )
 
-    def logit_bias_processor(
-        input_ids: List[int],
-        scores: List[float],
-    ) -> List[float]:
-        new_scores = [None] * len(scores)
-        for input_id, score in enumerate(scores):
-            new_scores[input_id] = score + to_bias.get(input_id, 0.0)
 
-        return new_scores
-
-    return logit_bias_processor
+openai_v1_tag = "OpenAI V1"
 
 
 @router.post(
     "/v1/completions",
+    summary="Completion",
+    dependencies=[Depends(authenticate)],
+    response_model=Union[
+        llama_cpp.CreateCompletionResponse,
+        str,
+    ],
+    responses={
+        "200": {
+            "description": "Successful Response",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/CreateCompletionResponse"}
+                        ],
+                        "title": "Completion response, when stream=False",
+                    }
+                },
+                "text/event-stream": {
+                    "schema": {
+                        "type": "string",
+                        "title": "Server Side Streaming response, when stream=True. "
+                        + "See SSE format: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#Event_stream_format",  # noqa: E501
+                        "example": """data: {... see CreateCompletionResponse ...} \\n\\n data: ... \\n\\n ... data: [DONE]""",
+                    }
+                },
+            },
+        }
+    },
+    tags=[openai_v1_tag],
+)
+@router.post(
+    "/v1/engines/copilot-codex/completions",
+    include_in_schema=False,
+    dependencies=[Depends(authenticate)],
+    tags=[openai_v1_tag],
 )
 async def create_completion(
     request: Request,
     body: CreateCompletionRequest,
-    llama: llama_cpp.Llama = Depends(get_llama),
 ) -> llama_cpp.Completion:
     if isinstance(body.prompt, list):
         assert len(body.prompt) <= 1
         body.prompt = body.prompt[0] if len(body.prompt) > 0 else ""
 
+    body_model = (
+        body.model
+        if request.url.path != "/v1/engines/copilot-codex/completions"
+        else "copilot-codex"
+    )
+
     exclude = {
         "n",
         "best_of",
-        "logit_bias",
         "logit_bias_type",
         "user",
+        "min_tokens",
     }
     kwargs = body.model_dump(exclude=exclude)
 
-    if body.logit_bias is not None:
-        kwargs['logits_processor'] = llama_cpp.LogitsProcessorList([
-            make_logit_bias_processor(llama, body.logit_bias, body.logit_bias_type),
-        ])
-
-    if body.stream:
+    # handle streaming request
+    if kwargs.get("stream", False):
         send_chan, recv_chan = anyio.create_memory_object_stream(10)
-
-        async def event_publisher(inner_send_chan: MemoryObjectSendStream):
-            async with inner_send_chan:
-                try:
-                    iterator: Iterator[llama_cpp.CompletionChunk] = await run_in_threadpool(llama, **kwargs)  # type: ignore
-                    async for chunk in iterate_in_threadpool(iterator):
-                        await inner_send_chan.send(dict(data=json.dumps(chunk)))
-                        if await request.is_disconnected():
-                            raise anyio.get_cancelled_exc_class()()
-                        if settings.interrupt_requests and llama_outer_lock.locked():
-                            await inner_send_chan.send(dict(data="[DONE]"))
-                            raise anyio.get_cancelled_exc_class()()
-                    await inner_send_chan.send(dict(data="[DONE]"))
-                except anyio.get_cancelled_exc_class() as e:
-                    print("disconnected")
-                    with anyio.move_on_after(1, shield=True):
-                        print(
-                            f"Disconnected from client (via refresh/close) {request.client}"
-                        )
-                        raise e
-
         return EventSourceResponse(
-            recv_chan, data_sender_callable=partial(event_publisher, send_chan)
-        ) # type: ignore
-    else:
-        completion: llama_cpp.Completion = await run_in_threadpool(llama, **kwargs)  # type: ignore
-        return completion
+            recv_chan,
+            data_sender_callable=partial(  # type: ignore
+                get_event_publisher,
+                request=request,
+                inner_send_chan=send_chan,
+                body=body,
+                body_model=body_model,
+                llama_call=llama_cpp.Llama.__call__,
+                kwargs=kwargs,
+            ),
+            sep="\n",
+            ping_message_factory=_ping_message_factory,
+        )
 
+    # handle regular request
+    async with contextlib.asynccontextmanager(get_llama_proxy)() as llama_proxy:
+        llama = prepare_request_resources(body, llama_proxy, body_model, kwargs)
 
-class CreateEmbeddingRequest(BaseModel):
-    model: Optional[str] = model_field
-    input: Union[str, List[str]] = Field(description="The input to embed.")
-    user: Optional[str] = Field(default=None)
+        if await request.is_disconnected():
+            print(
+                f"Disconnected from client (via refresh/close) before llm invoked {request.client}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Client closed request",
+            )
 
-    model_config = {
-        "json_schema_extra": {
-            "examples": [
-                {
-                    "input": "The food was delicious and the waiter...",
-                }
-            ]
-        }
-    }
+        return await run_in_threadpool(llama, **kwargs)
 
 
 @router.post(
     "/v1/embeddings",
+    summary="Embedding",
+    dependencies=[Depends(authenticate)],
+    tags=[openai_v1_tag],
 )
 async def create_embedding(
-    request: CreateEmbeddingRequest, llama: llama_cpp.Llama = Depends(get_llama)
+    request: CreateEmbeddingRequest,
+    llama_proxy: LlamaProxy = Depends(get_llama_proxy),
 ):
     return await run_in_threadpool(
-        llama.create_embedding, **request.model_dump(exclude={"user"})
+        llama_proxy(request.model).create_embedding,
+        **request.model_dump(exclude={"user"}),
     )
-
-
-class ChatCompletionRequestMessage(BaseModel):
-    role: Literal["system", "user", "assistant"] = Field(
-        default="user", description="The role of the message."
-    )
-    content: str = Field(default="", description="The content of the message.")
-
-
-class CreateChatCompletionRequest(BaseModel):
-    messages: List[ChatCompletionRequestMessage] = Field(
-        default=[], description="A list of messages to generate completions for."
-    )
-    max_tokens: int = max_tokens_field
-    temperature: float = temperature_field
-    top_p: float = top_p_field
-    mirostat_mode: int = mirostat_mode_field
-    mirostat_tau: float = mirostat_tau_field
-    mirostat_eta: float = mirostat_eta_field
-    stop: Optional[List[str]] = stop_field
-    stream: bool = stream_field
-    presence_penalty: Optional[float] = presence_penalty_field
-    frequency_penalty: Optional[float] = frequency_penalty_field
-    logit_bias: Optional[Dict[str, float]] = Field(None)
-
-    # ignored or currently unsupported
-    model: Optional[str] = model_field
-    n: Optional[int] = 1
-    user: Optional[str] = Field(None)
-
-    # llama.cpp specific parameters
-    top_k: int = top_k_field
-    repeat_penalty: float = repeat_penalty_field
-    logit_bias_type: Optional[Literal["input_ids", "tokens"]] = Field(None)
-
-    model_config = {
-        "json_schema_extra": {
-            "examples": [
-                {
-                    "messages": [
-                        ChatCompletionRequestMessage(
-                            role="system", content="You are a helpful assistant."
-                        ).model_dump(),
-                        ChatCompletionRequestMessage(
-                            role="user", content="What is the capital of France?"
-                        ).model_dump(),
-                    ]
-                }
-            ]
-        }
-    }
 
 
 @router.post(
     "/v1/chat/completions",
+    summary="Chat",
+    dependencies=[Depends(authenticate)],
+    response_model=Union[llama_cpp.ChatCompletion, str],
+    responses={
+        "200": {
+            "description": "Successful Response",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "anyOf": [
+                            {
+                                "$ref": "#/components/schemas/CreateChatCompletionResponse"
+                            }
+                        ],
+                        "title": "Completion response, when stream=False",
+                    }
+                },
+                "text/event-stream": {
+                    "schema": {
+                        "type": "string",
+                        "title": "Server Side Streaming response, when stream=True"
+                        + "See SSE format: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#Event_stream_format",  # noqa: E501
+                        "example": """data: {... see CreateChatCompletionResponse ...} \\n\\n data: ... \\n\\n ... data: [DONE]""",
+                    }
+                },
+            },
+        }
+    },
+    tags=[openai_v1_tag],
 )
 async def create_chat_completion(
     request: Request,
-    body: CreateChatCompletionRequest,
-    llama: llama_cpp.Llama = Depends(get_llama),
-    settings: Settings = Depends(get_settings),
+    body: CreateChatCompletionRequest = Body(
+        openapi_examples={
+            "normal": {
+                "summary": "Chat Completion",
+                "value": {
+                    "model": "gpt-3.5-turbo",
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": "What is the capital of France?"},
+                    ],
+                },
+            },
+            "json_mode": {
+                "summary": "JSON Mode",
+                "value": {
+                    "model": "gpt-3.5-turbo",
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": "Who won the world series in 2020"},
+                    ],
+                    "response_format": {"type": "json_object"},
+                },
+            },
+            "tool_calling": {
+                "summary": "Tool Calling",
+                "value": {
+                    "model": "gpt-3.5-turbo",
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": "Extract Jason is 30 years old."},
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "User",
+                                "description": "User record",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "age": {"type": "number"},
+                                    },
+                                    "required": ["name", "age"],
+                                },
+                            },
+                        }
+                    ],
+                    "tool_choice": {
+                        "type": "function",
+                        "function": {
+                            "name": "User",
+                        },
+                    },
+                },
+            },
+            "logprobs": {
+                "summary": "Logprobs",
+                "value": {
+                    "model": "gpt-3.5-turbo",
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": "What is the capital of France?"},
+                    ],
+                    "logprobs": True,
+                    "top_logprobs": 10,
+                },
+            },
+        }
+    ),
 ) -> llama_cpp.ChatCompletion:
+    # This is a workaround for an issue in FastAPI dependencies
+    # where the dependency is cleaned up before a StreamingResponse
+    # is complete.
+    # https://github.com/tiangolo/fastapi/issues/11143
+
+    body_model = body.model
     exclude = {
         "n",
-        "logit_bias",
         "logit_bias_type",
         "user",
+        "min_tokens",
     }
     kwargs = body.model_dump(exclude=exclude)
 
-    if body.logit_bias is not None:
-        kwargs['logits_processor'] = llama_cpp.LogitsProcessorList([
-            make_logit_bias_processor(llama, body.logit_bias, body.logit_bias_type),
-        ])
-
-    if body.stream:
+    # handle streaming request
+    if kwargs.get("stream", False):
         send_chan, recv_chan = anyio.create_memory_object_stream(10)
-
-        async def event_publisher(inner_send_chan: MemoryObjectSendStream):
-            async with inner_send_chan:
-                try:
-                    iterator: Iterator[llama_cpp.ChatCompletionChunk] = await run_in_threadpool(llama.create_chat_completion, **kwargs)  # type: ignore
-                    async for chat_chunk in iterate_in_threadpool(iterator):
-                        await inner_send_chan.send(dict(data=json.dumps(chat_chunk)))
-                        if await request.is_disconnected():
-                            raise anyio.get_cancelled_exc_class()()
-                        if settings.interrupt_requests and llama_outer_lock.locked():
-                            await inner_send_chan.send(dict(data="[DONE]"))
-                            raise anyio.get_cancelled_exc_class()()
-                    await inner_send_chan.send(dict(data="[DONE]"))
-                except anyio.get_cancelled_exc_class() as e:
-                    print("disconnected")
-                    with anyio.move_on_after(1, shield=True):
-                        print(
-                            f"Disconnected from client (via refresh/close) {request.client}"
-                        )
-                        raise e
-
         return EventSourceResponse(
             recv_chan,
-            data_sender_callable=partial(event_publisher, send_chan),
-        ) # type: ignore
-    else:
-        completion: llama_cpp.ChatCompletion = await run_in_threadpool(
-            llama.create_chat_completion, **kwargs  # type: ignore
+            data_sender_callable=partial(  # type: ignore
+                get_event_publisher,
+                request=request,
+                inner_send_chan=send_chan,
+                body=body,
+                body_model=body_model,
+                llama_call=llama_cpp.Llama.create_chat_completion,
+                kwargs=kwargs,
+            ),
+            sep="\n",
+            ping_message_factory=_ping_message_factory,
         )
-        return completion
+
+    # handle regular request
+    async with contextlib.asynccontextmanager(get_llama_proxy)() as llama_proxy:
+        llama = prepare_request_resources(body, llama_proxy, body_model, kwargs)
+
+        if await request.is_disconnected():
+            print(
+                f"Disconnected from client (via refresh/close) before llm invoked {request.client}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Client closed request",
+            )
+
+        return await run_in_threadpool(llama.create_chat_completion, **kwargs)
 
 
-class ModelData(TypedDict):
-    id: str
-    object: Literal["model"]
-    owned_by: str
-    permissions: List[str]
-
-
-class ModelList(TypedDict):
-    object: Literal["list"]
-    data: List[ModelData]
-
-
-@router.get("/v1/models")
+@router.get(
+    "/v1/models",
+    summary="Models",
+    dependencies=[Depends(authenticate)],
+    tags=[openai_v1_tag],
+)
 async def get_models(
-    settings: Settings = Depends(get_settings),
+    llama_proxy: LlamaProxy = Depends(get_llama_proxy),
 ) -> ModelList:
-    assert llama is not None
     return {
         "object": "list",
         "data": [
             {
-                "id": settings.model_alias
-                if settings.model_alias is not None
-                else llama.model_path,
+                "id": model_alias,
                 "object": "model",
                 "owned_by": "me",
                 "permissions": [],
             }
+            for model_alias in llama_proxy
         ],
     }
+
+
+extras_tag = "Extras"
+
+
+@router.post(
+    "/extras/tokenize",
+    summary="Tokenize",
+    dependencies=[Depends(authenticate)],
+    tags=[extras_tag],
+)
+async def tokenize(
+    body: TokenizeInputRequest,
+    llama_proxy: LlamaProxy = Depends(get_llama_proxy),
+) -> TokenizeInputResponse:
+    tokens = llama_proxy(body.model).tokenize(body.input.encode("utf-8"), special=True)
+
+    return TokenizeInputResponse(tokens=tokens)
+
+
+@router.post(
+    "/extras/tokenize/count",
+    summary="Tokenize Count",
+    dependencies=[Depends(authenticate)],
+    tags=[extras_tag],
+)
+async def count_query_tokens(
+    body: TokenizeInputRequest,
+    llama_proxy: LlamaProxy = Depends(get_llama_proxy),
+) -> TokenizeInputCountResponse:
+    tokens = llama_proxy(body.model).tokenize(body.input.encode("utf-8"), special=True)
+
+    return TokenizeInputCountResponse(count=len(tokens))
+
+
+@router.post(
+    "/extras/detokenize",
+    summary="Detokenize",
+    dependencies=[Depends(authenticate)],
+    tags=[extras_tag],
+)
+async def detokenize(
+    body: DetokenizeInputRequest,
+    llama_proxy: LlamaProxy = Depends(get_llama_proxy),
+) -> DetokenizeInputResponse:
+    text = llama_proxy(body.model).detokenize(body.tokens).decode("utf-8")
+
+    return DetokenizeInputResponse(text=text)
